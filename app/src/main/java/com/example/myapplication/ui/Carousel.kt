@@ -42,17 +42,43 @@ import androidx.compose.ui.layout.Layout
 import androidx.compose.ui.layout.layoutId
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.tooling.preview.Preview
+import androidx.compose.ui.unit.Density
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
-import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.flow.filterNot
-import kotlinx.coroutines.withContext
 import kotlin.math.roundToInt
 import kotlin.random.Random
 
-
 internal enum class SwipeDirection { Forward, Backward }
+
+@OptIn(ExperimentalFoundationApi::class)
+private data class CarouselState<T>(
+    val anchoredDraggableState: AnchoredDraggableState<Position>,
+    val contentWithItems: ContentWithComposables<T>,
+)
+
+@OptIn(ExperimentalFoundationApi::class)
+internal class AnchoredDraggableCreator(
+    private val confirmValueChange: (newValue: Position) -> Boolean = { true },
+    private val density: Density,
+) {
+    private val positionalThreshold = { distance: Float -> distance * 0.5f }
+    private val velocityThreshold = { with(density) { 20.dp.toPx() } }
+    private val snapAnimationSpec = tween<Float>()
+    private val decayAnimationSpec = exponentialDecay<Float>(10f)
+
+    fun create(): AnchoredDraggableState<Position> {
+        return AnchoredDraggableState(
+            initialValue = Position.Center,
+            snapAnimationSpec = snapAnimationSpec,
+            decayAnimationSpec = decayAnimationSpec,
+            positionalThreshold = positionalThreshold,
+            velocityThreshold = velocityThreshold,
+            confirmValueChange = confirmValueChange
+        )
+    }
+}
 
 @OptIn(ExperimentalFoundationApi::class)
 @Composable
@@ -66,9 +92,6 @@ internal fun <T> Carousel(
     BoxWithConstraints(modifier = modifier.fillMaxSize()) {
         if (constraints.isZero) return@BoxWithConstraints
         // saving carousel state
-        var contentWithItems by remember {
-            mutableStateOf(ContentWithComposables.from(item, content))
-        }
 
         val updatingContent by rememberUpdatedState(content)
 
@@ -82,47 +105,23 @@ internal fun <T> Carousel(
             }
         }
         val density = LocalDensity.current
-        val positionalThreshold = { distance: Float -> distance * 0.5f }
-        val velocityThreshold = { with(density) { 20.dp.toPx() } }
-        val snapAnimationSpec = tween<Float>()
-        val decayAnimationSpec = exponentialDecay<Float>(10f)
+        val creator = remember(density, confirmValueChange) {
+            AnchoredDraggableCreator(confirmValueChange, density)
+        }
+        var carouselState by remember {
+            mutableStateOf(
+                CarouselState(
+                    anchoredDraggableState = creator.create(),
+                    contentWithItems = ContentWithComposables.from(item, content)
+                )
+            )
+        }
 
-        val anchoredDraggableState = rememberSaveable(
-            saver = AnchoredDraggableState.Saver(
-                snapAnimationSpec = snapAnimationSpec,
-                decayAnimationSpec = decayAnimationSpec,
-                positionalThreshold = positionalThreshold,
-                velocityThreshold = velocityThreshold,
-                confirmValueChange = confirmValueChange,
-            )
-        ) {
-            AnchoredDraggableState(
-                initialValue = Position.Center,
-                snapAnimationSpec = snapAnimationSpec,
-                decayAnimationSpec = decayAnimationSpec,
-                positionalThreshold = positionalThreshold,
-                velocityThreshold = velocityThreshold,
-                confirmValueChange = confirmValueChange
-            )
-        }
         val maxWidth = constraints.maxWidth.toFloat()
-        SideEffect {
-            val offsetCenterItem = with(density) { centerItemHorizontalPadding.toPx() }
-            val itemWidth = with(density) { maxWidth - (centerItemHorizontalPadding.toPx() * 2)}
-            val positionLeftItem = with(density) { itemWidth + itemSpacing.toPx() + offsetCenterItem }
-            val positionRightItem = with(density) { - itemWidth - itemSpacing.toPx() + offsetCenterItem }
-            anchoredDraggableState.updateAnchors(
-                DraggableAnchors {
-                    Position.Right at positionRightItem
-                    Position.Center at offsetCenterItem
-                    Position.Left at positionLeftItem
-                }
-            )
-        }
 
         LaunchedEffect(Unit) {
             var programmaticAnimationWasInProgress = false
-            var previousContentWithItems = contentWithItems
+            var previousContentWithItems = carouselState.contentWithItems
             snapshotFlow { updatingContent }
                 .filterNot { previousContentWithItems.sameContent(it) }
                 .collectLatest { content ->
@@ -135,33 +134,51 @@ internal fun <T> Carousel(
                     )
                     previousContentWithItems = newContent
 
-                    if (anchoredDraggableState.currentValue == Position.Center && direction != null) {
+                    if (carouselState.anchoredDraggableState.currentValue == Position.Center && direction != null) {
                         val position = when (direction) {
                             SwipeDirection.Forward -> Position.Right
                             SwipeDirection.Backward -> Position.Left
                         }
                         if (!programmaticAnimationWasInProgress) {
                             programmaticAnimationWasInProgress = true
-                            anchoredDraggableState.animateTo(position)
+                            carouselState.anchoredDraggableState.animateTo(position)
                         } else {
                             // previous animateTo was interrupted, so we re-center and animate to side
-                            contentWithItems = prev
-                            anchoredDraggableState.snapTo(Position.Center)
-                            anchoredDraggableState.animateTo(position)
+                            carouselState = CarouselState(
+                                contentWithItems = prev,
+                                anchoredDraggableState = creator.create().also {
+                                    it.animateTo(position)
+                                },
+                            )
                         }
                         programmaticAnimationWasInProgress = false
                     }
 
-                    withContext(NonCancellable) {
-                        anchoredDraggableState.snapTo(Position.Center)
-                    }
-                    contentWithItems = newContent
+                    carouselState = CarouselState(
+                        contentWithItems = newContent,
+                        anchoredDraggableState = creator.create()
+                    )
                 }
+        }
+
+        val currentState = carouselState
+        SideEffect {
+            val offsetCenterItem = with(density) { centerItemHorizontalPadding.toPx() }
+            val itemWidth = with(density) { maxWidth - (centerItemHorizontalPadding.toPx() * 2)}
+            val positionLeftItem = with(density) { itemWidth + itemSpacing.toPx() + offsetCenterItem }
+            val positionRightItem = with(density) { - itemWidth - itemSpacing.toPx() + offsetCenterItem }
+            currentState.anchoredDraggableState.updateAnchors(
+                DraggableAnchors {
+                    Position.Right at positionRightItem
+                    Position.Center at offsetCenterItem
+                    Position.Left at positionLeftItem
+                }
+            )
         }
 
         Layout(
             modifier = Modifier.anchoredDraggable(
-                state = anchoredDraggableState,
+                state = currentState.anchoredDraggableState,
                 orientation = Orientation.Horizontal,
                 enabled = false,
             ),
@@ -170,25 +187,25 @@ internal fun <T> Carousel(
                     modifier = Modifier
                         .layoutId(Position.Left)
                 ) {
-                    contentWithItems.left?.composable?.invoke()
+                    currentState.contentWithItems.left?.composable?.invoke()
                 }
 
                 Box(
                     modifier = Modifier
                         .layoutId(Position.Center)
                 ) {
-                    contentWithItems.center.composable.invoke()
+                    currentState.contentWithItems.center.composable.invoke()
                 }
 
                 Box(
                     modifier = Modifier
                         .layoutId(Position.Right)
                 ) {
-                    contentWithItems.right?.composable?.invoke()
+                    currentState.contentWithItems.right?.composable?.invoke()
                 }
             }
         ) { measurables, constraints ->
-            val offset = anchoredDraggableState.offset
+            val offset = currentState.anchoredDraggableState.offset
 
             // calculating items size
             val itemWidth = (constraints.maxWidth - 2 * centerItemHorizontalPadding.toPx()).roundToInt()

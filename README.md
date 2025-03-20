@@ -1,4 +1,4 @@
-# honor-bug-carousel
+# honor-bug-carousel (branch with fix)
 
 This project was created to show different behavior in the user interface of different vendors.
 
